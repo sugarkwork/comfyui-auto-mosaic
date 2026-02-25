@@ -130,7 +130,7 @@ def extract_and_save_segments(
         {"name": "base image", "image": img_pil}
     )
 
-    target_classes = target_class.split(",")
+    target_classes = [clsname.strip() for clsname in target_class.split(",")]
     
     # Process results
     for result_idx, result in enumerate(results):

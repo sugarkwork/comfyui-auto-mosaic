@@ -1,3 +1,6 @@
 ultralytics
 psd-tools
 opencv-python-headless
+gradio
+torch
+torchvision

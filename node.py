@@ -53,8 +53,10 @@ def download_file(url, target_path):
     except Exception as e:
         print(f"Error downloading {CUSTOM_MODEL_NAME}: {e}")
         return False
-
-from .extract_segments import extract_and_save_segments, MosaicMode
+try:
+    from .extract_segments import extract_and_save_segments, MosaicMode
+except ImportError:
+    from extract_segments import extract_and_save_segments, MosaicMode
 
 class AutoMosaic:
     def __init__(self):
