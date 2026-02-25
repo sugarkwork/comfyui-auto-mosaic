@@ -11,9 +11,9 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/yourusername/comfyui-auto-mosaic"
+Repository = "https://github.com/sugarkwork/comfyui-auto-mosaic"
 
 [tool.comfy]
-PublisherId = "sugarkwork"
+PublisherId = "sugarknight"
 DisplayName = "ComfyUI AutoMosaic"
 Icon = ""
