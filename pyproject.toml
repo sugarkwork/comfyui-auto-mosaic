@@ -1,0 +1,19 @@
+[project]
+name = "comfyui-auto-mosaic"
+description = "Auto detect and process sensitive areas using YOLO with mosaic, blur, white out, and PSD export."
+version = "1.0.0"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "ultralytics",
+    "psd-tools",
+    "opencv-python-headless"
+]
+
+[project.urls]
+Repository = "https://github.com/yourusername/comfyui-auto-mosaic"
+
+[tool.comfy]
+PublisherId = "sugarkwork"
+DisplayName = "ComfyUI AutoMosaic"
+Icon = ""
