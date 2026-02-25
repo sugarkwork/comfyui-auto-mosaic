@@ -1,0 +1,3 @@
+ultralytics
+psd-tools
+opencv-python-headless
