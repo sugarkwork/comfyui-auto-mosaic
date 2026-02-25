@@ -57,7 +57,7 @@ ComfyUI本体を起動しなくても、本ノードの機能をブラウザか�
    付属のバッチファイルを実行するだけで、必要な環境（Python仮想環境の作成、ライブラリのインストール）が自動でセットアップされ、WebUIが起動します。
    ```bash
    # Windowsの場合
-   start_standaline.bat
+   start_standalone.bat
    ```
    ※ 初回起動時に `config.txt` ファイルがない場合は自動生成され、メモ帳が開きます。必要なPythonとCUDAのバージョンを指定して保存してください。
 

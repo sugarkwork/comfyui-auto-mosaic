@@ -1,25 +1,24 @@
 @echo off
 cd /d "%~dp0"
 setlocal enabledelayedexpansion
-chcp 65001 > nul 2>&1
 
 :: ========================================================
 :: 1. Config File Generation and Editing
 :: ========================================================
 set "CONFIG_FILE=config.txt"
 
-:: ファイルが存在するかチェック
+:: Check if config file exists
 if exist "%CONFIG_FILE%" (
     echo [INFO] Config file found. Skipping editor.
-    :: ファイルがあるので編集処理を飛ばして次へ
+    :: If file exists, skip creation and go to parser
     goto :ConfigParse
 )
 
-:: --- ここから下はファイルがない場合のみ実行される ---
+:: --- Below runs only if config file is not found ---
 
 echo [INFO] Config file not found. Creating template...
 
-:: テンプレートの作成
+:: Create template
 (
     echo PYTHON_VERSION=3.12.11
     echo CUDA_VERSION=cu130
@@ -27,7 +26,7 @@ echo [INFO] Config file not found. Creating template...
 
 echo [INFO] Opening Notepad. Please edit and save/close to continue...
 
-:: メモ帳を起動し、閉じられるまで待機する
+:: Open notepad and wait until closed
 ::start /wait notepad.exe "%CONFIG_FILE%"
 ::echo [INFO] Editor closed. Resuming script...
 
@@ -40,17 +39,17 @@ echo [INFO] Reading configuration...
 set "CFG_PYTHON="
 set "CFG_CUDA="
 
-:: 設定ファイルの読み込みループ
+:: Loop to read config file
 for /f "usebackq tokens=1,2 delims==" %%a in ("%CONFIG_FILE%") do (
     set "key=%%a"
     set "val=%%b"
     
-    :: キーの判定
+    :: Check keys
     if /i "!key!"=="PYTHON_VERSION" set "CFG_PYTHON=!val!"
     if /i "!key!"=="CUDA_VERSION" set "CFG_CUDA=!val!"
 )
 
-:: 値が取得できたかチェック
+:: Check if values were retrieved
 if "!CFG_PYTHON!"=="" (
     echo [ERROR] PYTHON_VERSION is missing in config.txt
     pause
@@ -65,7 +64,7 @@ if "!CFG_CUDA!"=="" (
 echo [CONFIG] Python Version: !CFG_PYTHON!
 echo [CONFIG] CUDA Version  : !CFG_CUDA!
 
-:: CUDAバージョンのバリデーションとURL決定
+:: Validate CUDA version and define URL
 set "TORCH_INDEX_URL="
 set "IS_VALID_CUDA=0"
 
@@ -187,7 +186,7 @@ if exist ".venv\Scripts\python.exe" (
 echo [UPDATE] Installing/Updating PyTorch for !CFG_CUDA!...
 echo [INFO] Index URL: !TORCH_INDEX_URL!
 
-:: 依存関係解決とインストールの実行
+:: Execute dependency resolution and installation
 uv pip install -p .venv -U pip setuptools wheel
 uv pip install -p .venv torch torchvision --index-url !TORCH_INDEX_URL!
 
@@ -196,7 +195,7 @@ echo [SUCCESS] Environment setup complete.
 echo Python: !CFG_PYTHON!
 echo CUDA  : !CFG_CUDA!
 .venv\Scripts\python --version
-:: TorchのバージョンとCUDA利用可否を簡易チェック
+:: Simple check for Torch version and CUDA availability
 .venv\Scripts\python -c "import torch; print('Torch:', torch.__version__); print('CUDA Available:', torch.cuda.is_available())"
 echo ---------------------------------------------------
 
