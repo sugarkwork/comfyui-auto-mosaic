@@ -24,8 +24,29 @@ if not os.path.exists(target_model_dir):
     except Exception as e:
         logging.error(f"Failed to create models directory {target_model_dir}: {e}")
 
-CUSTOM_MODEL_URL = "https://huggingface.co/sugarknight/sensitive-detect/resolve/main/sensitive_detect_v06.pt"
-CUSTOM_MODEL_NAME = "sensitive_detect_v06.pt"
+CUSTOM_MODEL_URL = "https://huggingface.co/sugarknight/sensitive-detect/resolve/main/sensitive_detect_v07.pt"
+CUSTOM_MODEL_NAME = "sensitive_detect_v07.pt"
+
+# YOLO model file extensions
+MODEL_EXTENSIONS = (".pt", ".pth", ".onnx")
+
+def get_available_models():
+    """Scan model directories and return a list of available model filenames."""
+    available = set()
+    # Always include the custom model as an option
+    available.add(CUSTOM_MODEL_NAME)
+    # Scan both directories for model files
+    for d in [ultralytics_dir, yolo_dir]:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.lower().endswith(MODEL_EXTENSIONS) and os.path.isfile(os.path.join(d, f)):
+                    available.add(f)
+    model_list = sorted(available)
+    # Ensure custom model is first (default)
+    if CUSTOM_MODEL_NAME in model_list:
+        model_list.remove(CUSTOM_MODEL_NAME)
+        model_list.insert(0, CUSTOM_MODEL_NAME)
+    return model_list if model_list else [CUSTOM_MODEL_NAME]
 
 def download_file(url, target_path):
     print(f"Downloading {url} to {target_path}...")
@@ -74,17 +95,16 @@ class AutoMosaic:
                 "process_method": (["raw", "mosaic", "white", "blur"], {"default": "mosaic"}),
                 "factor": ("INT", {"default": 100, "min": 10, "step": 1}),
                 "target_class": ("STRING", {"default": "pussy,penis"}),
+                "model_name": (get_available_models(), {"default": CUSTOM_MODEL_NAME}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "MASK")
     OUTPUT_NODE = True
     FUNCTION = "process_image"
     CATEGORY = "image/process"
 
-    def process_image(self, image, save_psd, filename_prefix, confidence, process_method, factor, target_class):
-        model_name = CUSTOM_MODEL_NAME
-        
+    def process_image(self, image, save_psd, filename_prefix, confidence, process_method, factor, target_class, model_name=CUSTOM_MODEL_NAME):
         # Load model only if not loaded or model name changed
         if self.model is None or self.model_name != model_name:
             
@@ -123,6 +143,7 @@ class AutoMosaic:
             mosaic_mode = MosaicMode.RAW
 
         processed_images = []
+        processed_masks = []
         for i, img_tensor in enumerate(image):
             # Convert ComfyUI tensor [H, W, C] to numpy array
             img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
@@ -131,7 +152,7 @@ class AutoMosaic:
             full_output_folder, filename, counter, subfolder, filename_prefix_res = folder_paths.get_save_image_path(filename_prefix, output_dir, img_np.shape[1], img_np.shape[0])
             base_name = f"{filename}_{counter:05}"
             
-            composite_pil = extract_and_save_segments(
+            composite_pil, mask_pil = extract_and_save_segments(
                 img_pil=img_pil,
                 base_name=base_name,
                 model=self.model,
@@ -148,7 +169,12 @@ class AutoMosaic:
             out_img_tensor = torch.from_numpy(out_img_np)
             processed_images.append(out_img_tensor)
 
-        return {"ui": {"text": ["Successfully saved PSD"]}, "result": (torch.stack(processed_images),)}
+            # Convert mask PIL (mode 'L') to ComfyUI MASK tensor [H, W]
+            mask_np = np.array(mask_pil).astype(np.float32) / 255.0
+            mask_tensor = torch.from_numpy(mask_np)
+            processed_masks.append(mask_tensor)
+
+        return {"ui": {"text": ["Successfully saved PSD"]}, "result": (torch.stack(processed_images), torch.stack(processed_masks))}
 
 # Standard ComfyUI node mappings
 NODE_CLASS_MAPPINGS = {

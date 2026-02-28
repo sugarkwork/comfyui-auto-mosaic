@@ -113,10 +113,13 @@ def extract_and_save_segments(
         h, w = img_np.shape[:2]
     except Exception as e:
         print(f"Failed to load image: {e}")
-        return
+        return None, None
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+
+    # Combined mask for all target class detections
+    combined_mask = np.zeros((h, w), dtype=np.float32)
 
     # Predict
     print(f"Running prediction with confidence threshold: {confidence}...")
@@ -171,6 +174,9 @@ def extract_and_save_segments(
             out_pil = Image.fromarray(rgba_img, 'RGBA')
 
             if cls_name in target_classes:
+                # Accumulate this mask into the combined mask
+                combined_mask = np.maximum(combined_mask, mask_bin)
+
                 if mosaic_mode == MosaicMode.MOSAIC:
                     out_pil = generate_mosaic(out_pil, block_size)
                 elif mosaic_mode == MosaicMode.BLUR:
@@ -199,7 +205,10 @@ def extract_and_save_segments(
         layer_img = layer_info['image'].convert("RGBA")
         composite_image = Image.alpha_composite(composite_image, layer_img)
 
-    return composite_image.convert("RGB")
+    # Convert combined_mask to PIL Image (mode 'L')
+    combined_mask_pil = Image.fromarray((np.clip(combined_mask, 0, 1) * 255).astype(np.uint8), mode='L')
+
+    return composite_image.convert("RGB"), combined_mask_pil
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract all YOLO segments from an image and save them as individual PNG files.")
@@ -211,11 +220,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     model = YOLO(args.model)
 
-    extract_and_save_segments(
+    result_img, result_mask = extract_and_save_segments(
         img_pil=Image.open(args.image).convert('RGB'),
         base_name=os.path.splitext(os.path.basename(args.image))[0],
         model=model,
         output_dir=args.output,
         confidence=args.conf,
         mosaic_mode=MosaicMode.MOSAIC
-    ).save("test.png")
+    )
+    result_img.save("test.png")
+    result_mask.save("test_mask.png")
