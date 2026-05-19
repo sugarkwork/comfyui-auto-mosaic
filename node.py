@@ -75,9 +75,25 @@ def download_file(url, target_path):
         print(f"Error downloading {CUSTOM_MODEL_NAME}: {e}")
         return False
 try:
-    from .extract_segments import extract_and_save_segments, MosaicMode
+    from .extract_segments import (
+        extract_and_save_segments,
+        MosaicMode,
+        detect_frame,
+        render_processed_layer,
+        compose_frame,
+        fill_video_gaps,
+        save_images_to_psd,
+    )
 except ImportError:
-    from extract_segments import extract_and_save_segments, MosaicMode
+    from extract_segments import (
+        extract_and_save_segments,
+        MosaicMode,
+        detect_frame,
+        render_processed_layer,
+        compose_frame,
+        fill_video_gaps,
+        save_images_to_psd,
+    )
 
 class AutoMosaic:
     def __init__(self):
@@ -97,6 +113,9 @@ class AutoMosaic:
                 "target_class": ("STRING", {"default": "pussy,penis"}),
                 "model_name": (get_available_models(), {"default": CUSTOM_MODEL_NAME}),
                 "mask_expand": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "video_mode": ("BOOLEAN", {"default": False}),
+                "buffer_frames": ("INT", {"default": 10, "min": 1, "max": 120, "step": 1}),
+                "morph_method": (["simple", "optical_flow"], {"default": "simple"}),
             },
         }
 
@@ -139,11 +158,20 @@ class AutoMosaic:
         return MosaicMode.RAW
 
     def process_image(self, image, save_psd, filename_prefix, confidence, process_method, factor,
-                      target_class, model_name=CUSTOM_MODEL_NAME, mask_expand=0.0):
+                      target_class, model_name=CUSTOM_MODEL_NAME, mask_expand=0.0,
+                      video_mode=False, buffer_frames=10, morph_method="simple"):
         self._ensure_model(model_name)
 
         output_dir = folder_paths.get_output_directory()
         mosaic_mode = self._resolve_mosaic_mode(process_method)
+
+        if video_mode and len(image) > 1:
+            return self._process_video(
+                image=image, save_psd=save_psd, filename_prefix=filename_prefix,
+                confidence=confidence, mosaic_mode=mosaic_mode, factor=factor,
+                target_class=target_class, output_dir=output_dir,
+                mask_expand=mask_expand, buffer_frames=buffer_frames, morph_method=morph_method,
+            )
 
         processed_images = []
         processed_masks = []
@@ -176,6 +204,66 @@ class AutoMosaic:
             processed_masks.append(torch.from_numpy(mask_np))
 
         return {"ui": {"text": ["Successfully saved PSD"]}, "result": (torch.stack(processed_images), torch.stack(processed_masks))}
+
+    def _process_video(self, image, save_psd, filename_prefix, confidence, mosaic_mode, factor,
+                       target_class, output_dir, mask_expand, buffer_frames, morph_method):
+        target_classes = [c.strip() for c in target_class.split(",")]
+
+        frames_pil = []
+        frames_np = []
+        for img_tensor in image:
+            arr = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
+            frames_np.append(arr)
+            frames_pil.append(Image.fromarray(arr))
+
+        h, w = frames_np[0].shape[:2]
+
+        full_output_folder, filename, counter, _subfolder, _prefix_res = folder_paths.get_save_image_path(
+            filename_prefix, output_dir, w, h
+        )
+        os.makedirs(full_output_folder, exist_ok=True)
+
+        # Detect on every frame.
+        frame_class_masks = []
+        for img_pil in frames_pil:
+            class_masks, _segments = detect_frame(
+                img_pil, self.model, confidence, target_classes, factor, mask_expand=mask_expand,
+            )
+            frame_class_masks.append(class_masks)
+
+        # Fill gaps using simple morph + optical-flow tracking per spec.
+        fill_video_gaps(frames_np, frame_class_masks, buffer_frames, morph_method)
+
+        # Render each frame.
+        processed_images = []
+        processed_masks = []
+        for i, img_pil in enumerate(frames_pil):
+            layers_rgba = []
+            combined = np.zeros((h, w), dtype=np.float32)
+            for cls_name, mask in frame_class_masks[i].items():
+                combined = np.maximum(combined, mask)
+                layers_rgba.append(render_processed_layer(img_pil, mask, mosaic_mode, factor))
+
+            composite_pil = compose_frame(img_pil, layers_rgba)
+
+            if save_psd:
+                psd_layers = [{"name": "base image", "image": img_pil}]
+                for idx, (cls_name, mask) in enumerate(frame_class_masks[i].items()):
+                    psd_layers.append({"name": f"{cls_name} image {idx}", "image": layers_rgba[idx]})
+                base_name = f"{filename}_{counter + i:05}"
+                add_index = 0
+                save_path = os.path.join(full_output_folder, f"{base_name}.psd")
+                while os.path.exists(save_path):
+                    add_index += 1
+                    save_path = os.path.join(full_output_folder, f"{base_name}_{add_index:05}.psd")
+                save_images_to_psd(psd_layers, save_path)
+
+            out_img_np = np.array(composite_pil).astype(np.float32) / 255.0
+            processed_images.append(torch.from_numpy(out_img_np))
+            processed_masks.append(torch.from_numpy(np.clip(combined, 0, 1).astype(np.float32)))
+
+        return {"ui": {"text": [f"Processed {len(frames_pil)} frames in video mode"]},
+                "result": (torch.stack(processed_images), torch.stack(processed_masks))}
 
 # Standard ComfyUI node mappings
 NODE_CLASS_MAPPINGS = {

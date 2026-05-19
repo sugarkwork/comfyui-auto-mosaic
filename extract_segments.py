@@ -156,6 +156,167 @@ def compose_frame(img_pil, processed_layers):
     return composite.convert("RGB")
 
 
+def morph_masks_simple(mask_a: np.ndarray, mask_b: np.ndarray, t: float) -> np.ndarray:
+    """Linear interpolation between two float masks, then threshold to binary float."""
+    blended = mask_a * (1.0 - t) + mask_b * t
+    return (blended > 0.5).astype(np.float32)
+
+
+_LK_PARAMS = dict(
+    winSize=(21, 21),
+    maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+)
+
+
+def track_mask_optical_flow(prev_frame_np: np.ndarray, curr_frame_np: np.ndarray, prev_mask: np.ndarray) -> np.ndarray:
+    """Track polygon contour points of prev_mask from prev_frame to curr_frame using LK optical flow.
+
+    Returns a new float [H,W] mask filled from tracked polygons. Returns zeros if tracking fails.
+    """
+    if prev_mask.max() <= 0:
+        return np.zeros_like(prev_mask)
+
+    mask_uint8 = (prev_mask > 0.5).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)
+    if not contours:
+        return np.zeros_like(prev_mask)
+
+    prev_gray = cv2.cvtColor(prev_frame_np, cv2.COLOR_RGB2GRAY)
+    curr_gray = cv2.cvtColor(curr_frame_np, cv2.COLOR_RGB2GRAY)
+
+    new_mask = np.zeros_like(prev_mask)
+
+    for contour in contours:
+        if len(contour) < 3:
+            continue
+        epsilon = max(1.0, 0.002 * cv2.arcLength(contour, True))
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approx) < 3:
+            approx = contour
+
+        pts = approx.astype(np.float32).reshape(-1, 1, 2)
+        new_pts, status, _err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, pts, None, **_LK_PARAMS)
+
+        if new_pts is None or status is None:
+            continue
+
+        good = status.flatten() == 1
+        if good.sum() < 3:
+            continue
+
+        tracked = new_pts.copy()
+        tracked[~good] = pts[~good]
+        polygon = tracked.reshape(-1, 2).astype(np.int32)
+        cv2.fillPoly(new_mask, [polygon], 1.0)
+
+    return new_mask
+
+
+def _chain_track(frames_np, start_idx, end_idx, start_mask):
+    """Forward (start<end) or backward (start>end) chain optical-flow tracking.
+
+    Returns a dict {frame_idx: mask} including start_idx and end_idx.
+    """
+    masks = {start_idx: start_mask}
+    if start_idx == end_idx:
+        return masks
+
+    step = 1 if end_idx > start_idx else -1
+    prev_mask = start_mask
+    for j in range(start_idx + step, end_idx + step, step):
+        prev_mask = track_mask_optical_flow(frames_np[j - step], frames_np[j], prev_mask)
+        masks[j] = prev_mask
+    return masks
+
+
+def fill_video_gaps(frames_np, frame_class_masks, buffer_frames, morph_method):
+    """Fill detection gaps across a sequence of frames.
+
+    Args:
+        frames_np: list of RGB uint8 numpy arrays.
+        frame_class_masks: list of dicts {class_name: float mask} per frame; modified in place.
+        buffer_frames: max gap (in frames) to interpolate; longer gaps use optical-flow tail tracking up to this length.
+        morph_method: "simple" or "optical_flow" for the in-range interpolation.
+    """
+    n = len(frames_np)
+    if n == 0:
+        return
+
+    all_classes = set()
+    for cm in frame_class_masks:
+        all_classes.update(cm.keys())
+
+    for cls in all_classes:
+        detected = [i for i in range(n) if cls in frame_class_masks[i]]
+        if not detected:
+            continue
+
+        # 1) Leading frames before the first detection: backward-track up to buffer_frames.
+        first = detected[0]
+        lead_count = min(first, buffer_frames)
+        if lead_count > 0:
+            chain = _chain_track(frames_np, first, first - lead_count, frame_class_masks[first][cls])
+            for j in range(first - lead_count, first):
+                if cls not in frame_class_masks[j]:
+                    frame_class_masks[j][cls] = chain[j]
+
+        # 2) Gaps between consecutive detected frames.
+        for k in range(len(detected) - 1):
+            a, b = detected[k], detected[k + 1]
+            gap = b - a - 1
+            if gap <= 0:
+                continue
+
+            if gap <= buffer_frames:
+                # Within buffer: use user-selected method.
+                mask_a = frame_class_masks[a][cls]
+                mask_b = frame_class_masks[b][cls]
+                if morph_method == "optical_flow":
+                    fwd = _chain_track(frames_np, a, b, mask_a)
+                    bwd = _chain_track(frames_np, b, a, mask_b)
+                    for j in range(a + 1, b):
+                        t = (j - a) / (b - a)
+                        blended = fwd[j] * (1.0 - t) + bwd[j] * t
+                        new_mask = (blended > 0.5).astype(np.float32)
+                        if cls in frame_class_masks[j]:
+                            frame_class_masks[j][cls] = np.maximum(frame_class_masks[j][cls], new_mask)
+                        else:
+                            frame_class_masks[j][cls] = new_mask
+                else:
+                    for j in range(a + 1, b):
+                        t = (j - a) / (b - a)
+                        new_mask = morph_masks_simple(mask_a, mask_b, t)
+                        if cls in frame_class_masks[j]:
+                            frame_class_masks[j][cls] = np.maximum(frame_class_masks[j][cls], new_mask)
+                        else:
+                            frame_class_masks[j][cls] = new_mask
+            else:
+                # Gap larger than buffer: forward-track buffer_frames from a, backward-track buffer_frames from b.
+                fwd_end = a + buffer_frames
+                fwd = _chain_track(frames_np, a, fwd_end, frame_class_masks[a][cls])
+                for j in range(a + 1, fwd_end + 1):
+                    if cls not in frame_class_masks[j]:
+                        frame_class_masks[j][cls] = fwd[j]
+
+                bwd_end = b - buffer_frames
+                bwd = _chain_track(frames_np, b, bwd_end, frame_class_masks[b][cls])
+                for j in range(bwd_end, b):
+                    if cls not in frame_class_masks[j]:
+                        frame_class_masks[j][cls] = bwd[j]
+                    else:
+                        frame_class_masks[j][cls] = np.maximum(frame_class_masks[j][cls], bwd[j])
+
+        # 3) Trailing frames after the last detection: forward-track up to buffer_frames.
+        last = detected[-1]
+        tail_count = min(n - 1 - last, buffer_frames)
+        if tail_count > 0:
+            chain = _chain_track(frames_np, last, last + tail_count, frame_class_masks[last][cls])
+            for j in range(last + 1, last + tail_count + 1):
+                if cls not in frame_class_masks[j]:
+                    frame_class_masks[j][cls] = chain[j]
+
+
 def extract_and_save_segments(
     img_pil, base_name, model, output_dir, confidence=0.5,
     mosaic_mode: MosaicMode = MosaicMode.MOSAIC, target_class="pussy,penis", block_size=100,
