@@ -96,6 +96,7 @@ class AutoMosaic:
                 "factor": ("INT", {"default": 100, "min": 10, "step": 1}),
                 "target_class": ("STRING", {"default": "pussy,penis"}),
                 "model_name": (get_available_models(), {"default": CUSTOM_MODEL_NAME}),
+                "mask_expand": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.1}),
             },
         }
 
@@ -104,54 +105,57 @@ class AutoMosaic:
     FUNCTION = "process_image"
     CATEGORY = "image/process"
 
-    def process_image(self, image, save_psd, filename_prefix, confidence, process_method, factor, target_class, model_name=CUSTOM_MODEL_NAME):
-        # Load model only if not loaded or model name changed
-        if self.model is None or self.model_name != model_name:
-            
-            # Check if model exists in models/ultralytics or models/yolo
-            potential_paths = [
-                os.path.join(ultralytics_dir, model_name),
-                os.path.join(yolo_dir, model_name)
-            ]
-            
-            model_path = model_name
-            for path in potential_paths:
-                if os.path.isfile(path):
-                    model_path = path
-                    break
-            
-            # If the model is not found locally and it's our target custom model, download it
-            if not os.path.isfile(model_path) and model_name == CUSTOM_MODEL_NAME:
-                download_dest = os.path.join(target_model_dir, CUSTOM_MODEL_NAME)
-                if download_file(CUSTOM_MODEL_URL, download_dest):
-                    model_path = download_dest
-            
-            logging.info(f"Loading YOLO model: {model_path}")
-            self.model = YOLO(model_path)
-            self.model_name = model_name
+    def _ensure_model(self, model_name):
+        if self.model is not None and self.model_name == model_name:
+            return
+
+        potential_paths = [
+            os.path.join(ultralytics_dir, model_name),
+            os.path.join(yolo_dir, model_name),
+        ]
+        model_path = model_name
+        for path in potential_paths:
+            if os.path.isfile(path):
+                model_path = path
+                break
+
+        if not os.path.isfile(model_path) and model_name == CUSTOM_MODEL_NAME:
+            download_dest = os.path.join(target_model_dir, CUSTOM_MODEL_NAME)
+            if download_file(CUSTOM_MODEL_URL, download_dest):
+                model_path = download_dest
+
+        logging.info(f"Loading YOLO model: {model_path}")
+        self.model = YOLO(model_path)
+        self.model_name = model_name
+
+    @staticmethod
+    def _resolve_mosaic_mode(process_method):
+        if process_method == "mosaic":
+            return MosaicMode.MOSAIC
+        if process_method == "blur":
+            return MosaicMode.BLUR
+        if process_method == "white":
+            return MosaicMode.WHITE
+        return MosaicMode.RAW
+
+    def process_image(self, image, save_psd, filename_prefix, confidence, process_method, factor,
+                      target_class, model_name=CUSTOM_MODEL_NAME, mask_expand=0.0):
+        self._ensure_model(model_name)
 
         output_dir = folder_paths.get_output_directory()
-        
-        # Map process_method to MosaicMode
-        if process_method == "mosaic":
-            mosaic_mode = MosaicMode.MOSAIC
-        elif process_method == "blur":
-            mosaic_mode = MosaicMode.BLUR
-        elif process_method == "white":
-            mosaic_mode = MosaicMode.WHITE
-        else:
-            mosaic_mode = MosaicMode.RAW
+        mosaic_mode = self._resolve_mosaic_mode(process_method)
 
         processed_images = []
         processed_masks = []
-        for i, img_tensor in enumerate(image):
-            # Convert ComfyUI tensor [H, W, C] to numpy array
+        for img_tensor in image:
             img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
             img_pil = Image.fromarray(img_np)
-            
-            full_output_folder, filename, counter, subfolder, filename_prefix_res = folder_paths.get_save_image_path(filename_prefix, output_dir, img_np.shape[1], img_np.shape[0])
+
+            full_output_folder, filename, counter, _subfolder, _prefix_res = folder_paths.get_save_image_path(
+                filename_prefix, output_dir, img_np.shape[1], img_np.shape[0]
+            )
             base_name = f"{filename}_{counter:05}"
-            
+
             composite_pil, mask_pil = extract_and_save_segments(
                 img_pil=img_pil,
                 base_name=base_name,
@@ -161,18 +165,15 @@ class AutoMosaic:
                 mosaic_mode=mosaic_mode,
                 target_class=target_class,
                 block_size=factor,
-                save_psd=save_psd
+                save_psd=save_psd,
+                mask_expand=mask_expand,
             )
-            
-            # Convert composite PIL back to ComfyUI tensor formats
-            out_img_np = np.array(composite_pil).astype(np.float32) / 255.0
-            out_img_tensor = torch.from_numpy(out_img_np)
-            processed_images.append(out_img_tensor)
 
-            # Convert mask PIL (mode 'L') to ComfyUI MASK tensor [H, W]
+            out_img_np = np.array(composite_pil).astype(np.float32) / 255.0
+            processed_images.append(torch.from_numpy(out_img_np))
+
             mask_np = np.array(mask_pil).astype(np.float32) / 255.0
-            mask_tensor = torch.from_numpy(mask_np)
-            processed_masks.append(mask_tensor)
+            processed_masks.append(torch.from_numpy(mask_np))
 
         return {"ui": {"text": ["Successfully saved PSD"]}, "result": (torch.stack(processed_images), torch.stack(processed_masks))}
 

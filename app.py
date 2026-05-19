@@ -60,10 +60,11 @@ mosaic_node = AutoMosaic()
 # 3. Gradio Interface Logic
 # ==========================================
 
-def _run_node_on_np(img_np, save_psd, filename_prefix, confidence, process_method, factor, target_class):
+def _run_node_on_np(img_np, save_psd, filename_prefix, confidence, process_method, factor, target_class,
+                    mask_expand=0.0):
     """Helper to convert numpy array to tensor and run the node."""
     img_tensor = torch.from_numpy(img_np).unsqueeze(0)
-    
+
     result_dict = mosaic_node.process_image(
         image=img_tensor,
         save_psd=save_psd,
@@ -71,19 +72,21 @@ def _run_node_on_np(img_np, save_psd, filename_prefix, confidence, process_metho
         confidence=confidence,
         process_method=process_method,
         factor=factor,
-        target_class=target_class
+        target_class=target_class,
+        mask_expand=mask_expand,
     )
-    
+
     output_tensors = result_dict.get("result", (None,))[0]
     if output_tensors is None:
         return None
-        
+
     output_tensor = output_tensors[0]
     out_np = (output_tensor.cpu().numpy() * 255).astype(np.uint8)
     return out_np
 
 
-def process_ui_image(image_input, save_psd, filename_prefix, confidence, process_method, factor, target_class):
+def process_ui_image(image_input, save_psd, filename_prefix, confidence, process_method, factor, target_class,
+                     mask_expand):
     """Adapter function for single image Gradio processing."""
     global _current_mock_output_dir
     _current_mock_output_dir = dummy_output_dir # Use default for single UI
@@ -93,11 +96,14 @@ def process_ui_image(image_input, save_psd, filename_prefix, confidence, process
 
     if isinstance(image_input, np.ndarray):
         img_np = image_input.astype(np.float32) / 255.0
-    else: 
+    else:
         img_np = np.array(image_input).astype(np.float32) / 255.0
 
     try:
-        out_np = _run_node_on_np(img_np, save_psd, filename_prefix, confidence, process_method, factor, target_class)
+        out_np = _run_node_on_np(
+            img_np, save_psd, filename_prefix, confidence, process_method, factor, target_class,
+            mask_expand=mask_expand,
+        )
         if out_np is None:
              return None, "Error: Node returned no result tensor."
         return out_np, "Processing successful!"
@@ -107,7 +113,8 @@ def process_ui_image(image_input, save_psd, filename_prefix, confidence, process
         traceback.print_exc()
         return None, f"Error during processing: {str(e)}"
 
-def process_batch_directory(input_dir, output_dir, recursive, save_psd, confidence, process_method, factor, target_class):
+def process_batch_directory(input_dir, output_dir, recursive, save_psd, confidence, process_method, factor, target_class,
+                            mask_expand):
     """Adapter function for batch processing a directory."""
     global _current_mock_output_dir
     
@@ -157,13 +164,14 @@ def process_batch_directory(input_dir, output_dir, recursive, save_psd, confiden
             filename_prefix = img_file.stem
             
             out_np = _run_node_on_np(
-                img_np=img_np, 
-                save_psd=save_psd, 
-                filename_prefix=filename_prefix, 
-                confidence=confidence, 
-                process_method=process_method, 
-                factor=factor, 
-                target_class=target_class
+                img_np=img_np,
+                save_psd=save_psd,
+                filename_prefix=filename_prefix,
+                confidence=confidence,
+                process_method=process_method,
+                factor=factor,
+                target_class=target_class,
+                mask_expand=mask_expand,
             )
             
             if out_np is not None:
@@ -211,12 +219,17 @@ def build_processing_options_ui():
             label="Confidence Threshold"
         )
         factor = gr.Slider(
-            minimum=10, maximum=200, step=1, 
-            value=100, 
+            minimum=10, maximum=200, step=1,
+            value=100,
             label="Factor (Block size / Blur strength)"
         )
+        mask_expand = gr.Slider(
+            minimum=0.0, maximum=20.0, step=0.1,
+            value=0.0,
+            label="Mask Expand (% of long edge)"
+        )
         save_psd = gr.Checkbox(label="Save PSD file", value=False)
-    return process_method, target_class, confidence, factor, save_psd
+    return process_method, target_class, confidence, factor, mask_expand, save_psd
 
 with gr.Blocks(title="ComfyUI AutoMosaic Standalone") as app:
     gr.Markdown("# ComfyUI AutoMosaic - Standalone WebUI")
@@ -228,8 +241,8 @@ with gr.Blocks(title="ComfyUI AutoMosaic Standalone") as app:
             with gr.Row():
                 with gr.Column():
                     s_input_image = gr.Image(label="Input Image", type="numpy")
-                    s_process_method, s_target_class, s_confidence, s_factor, s_save_psd = build_processing_options_ui()
-                    
+                    s_process_method, s_target_class, s_confidence, s_factor, s_mask_expand, s_save_psd = build_processing_options_ui()
+
                     s_filename_prefix = gr.Textbox(value="StandaloneMosaic", label="Filename Prefix (for PSD)")
                     s_run_btn = gr.Button("Process Image", variant="primary")
 
@@ -240,8 +253,9 @@ with gr.Blocks(title="ComfyUI AutoMosaic Standalone") as app:
             s_run_btn.click(
                 fn=process_ui_image,
                 inputs=[
-                    s_input_image, s_save_psd, s_filename_prefix, 
-                    s_confidence, s_process_method, s_factor, s_target_class
+                    s_input_image, s_save_psd, s_filename_prefix,
+                    s_confidence, s_process_method, s_factor, s_target_class,
+                    s_mask_expand,
                 ],
                 outputs=[s_output_image, s_status_text]
             )
@@ -255,10 +269,10 @@ with gr.Blocks(title="ComfyUI AutoMosaic Standalone") as app:
                     b_output_dir = gr.Textbox(label="Output Directory Path", placeholder="C:/images/output")
                     b_recursive = gr.Checkbox(label="Process Subdirectories (Recursive)", value=True)
                     
-                    b_process_method, b_target_class, b_confidence, b_factor, b_save_psd = build_processing_options_ui()
-                    
+                    b_process_method, b_target_class, b_confidence, b_factor, b_mask_expand, b_save_psd = build_processing_options_ui()
+
                     b_run_btn = gr.Button("Start Batch Processing", variant="primary")
-                    
+
                 with gr.Column():
                     b_status_text = gr.Textbox(label="Batch Status", lines=15, interactive=False)
 
@@ -266,7 +280,8 @@ with gr.Blocks(title="ComfyUI AutoMosaic Standalone") as app:
                 fn=process_batch_directory,
                 inputs=[
                     b_input_dir, b_output_dir, b_recursive,
-                    b_save_psd, b_confidence, b_process_method, b_factor, b_target_class
+                    b_save_psd, b_confidence, b_process_method, b_factor, b_target_class,
+                    b_mask_expand,
                 ],
                 outputs=[b_status_text]
             )

@@ -68,95 +68,130 @@ def generate_white(masked_image: Image.Image, block_size: int) -> Image.Image:
     return white_rgba.filter(ImageFilter.GaussianBlur(radius=block_size))
 
 
+def _dilate_mask(mask_bin: np.ndarray, expand_px: int) -> np.ndarray:
+    """Dilate a float [0,1] mask with an elliptical kernel of given pixel radius."""
+    if expand_px <= 0:
+        return mask_bin
+    kernel_size = expand_px * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(mask_bin, kernel, iterations=1)
+
+
+def detect_frame(img_pil, model, confidence, target_classes, block_size, mask_expand=0.0):
+    """Run YOLO segmentation on a single frame and return per-class masks plus raw segments.
+
+    Returns:
+        class_masks: dict {class_name: float [H,W] mask} for target classes only
+        all_segments: list of dicts with keys 'cls_name', 'conf', 'mask' (for PSD export, all classes)
+    """
+    img_np = np.array(img_pil.convert("RGB"))
+    h, w = img_np.shape[:2]
+    long_edge = max(w, h)
+
+    block_margin_px = int(long_edge / block_size) if block_size > 0 else 0
+    user_expand_px = int(long_edge * mask_expand / 100.0) if mask_expand > 0 else 0
+
+    results = model.predict(img_pil, conf=confidence, verbose=False)
+
+    class_masks = {}
+    all_segments = []
+
+    for result in results:
+        if result.masks is None:
+            continue
+        masks_data = result.masks.data.cpu().numpy()
+        boxes = result.boxes.cpu()
+        class_names = model.names
+
+        for m, box in zip(masks_data, boxes):
+            mask_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+            mask_bin = np.clip(mask_resized, 0, 1).astype(np.float32)
+
+            mask_bin = _dilate_mask(mask_bin, block_margin_px)
+            mask_bin = _dilate_mask(mask_bin, user_expand_px)
+
+            cls_id = int(box.cls[0].item())
+            cls_name = class_names[cls_id]
+            conf = float(box.conf[0].item())
+
+            all_segments.append({"cls_name": cls_name, "conf": conf, "mask": mask_bin})
+
+            if cls_name in target_classes:
+                if cls_name not in class_masks:
+                    class_masks[cls_name] = np.zeros((h, w), dtype=np.float32)
+                class_masks[cls_name] = np.maximum(class_masks[cls_name], mask_bin)
+
+    return class_masks, all_segments
+
+
+def _make_rgba_from_mask(img_np_rgb: np.ndarray, mask: np.ndarray) -> Image.Image:
+    """Build an RGBA PIL image where alpha = mask*255."""
+    h, w = img_np_rgb.shape[:2]
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[:, :, :3] = img_np_rgb
+    rgba[:, :, 3] = (np.clip(mask, 0, 1) * 255).astype(np.uint8)
+    return Image.fromarray(rgba, 'RGBA')
+
+
+def render_processed_layer(img_pil, mask, mosaic_mode, block_size):
+    """Return the RGBA processed layer (mosaic/blur/white/raw) for a single mask."""
+    img_np = np.array(img_pil.convert("RGB"))
+    masked_pil = _make_rgba_from_mask(img_np, mask)
+
+    if mosaic_mode == MosaicMode.MOSAIC:
+        return generate_mosaic(masked_pil, block_size)
+    if mosaic_mode == MosaicMode.BLUR:
+        return generate_blur(masked_pil, block_size)
+    if mosaic_mode == MosaicMode.WHITE:
+        return generate_white(masked_pil, block_size)
+    return masked_pil
+
+
+def compose_frame(img_pil, processed_layers):
+    """Composite the base image with a list of RGBA layers (bottom to top)."""
+    base = img_pil.convert("RGBA")
+    composite = base
+    for layer in processed_layers:
+        composite = Image.alpha_composite(composite, layer.convert("RGBA"))
+    return composite.convert("RGB")
+
+
 def extract_and_save_segments(
-    img_pil, base_name, model, output_dir, confidence=0.5, 
-    mosaic_mode: MosaicMode = MosaicMode.MOSAIC, target_class="pussy,penis", block_size=100, save_psd=True) -> Image.Image:
+    img_pil, base_name, model, output_dir, confidence=0.5,
+    mosaic_mode: MosaicMode = MosaicMode.MOSAIC, target_class="pussy,penis", block_size=100,
+    save_psd=True, mask_expand: float = 0.0) -> Image.Image:
     """
     Load an image and YOLO segmentation model, detect all segments, and save them as individual images.
     """
-    # Load image
     try:
-        img_np = np.array(img_pil)
+        img_np = np.array(img_pil.convert("RGB"))
         h, w = img_np.shape[:2]
     except Exception as e:
         print(f"Failed to load image: {e}")
         return None, None
 
-    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Combined mask for all target class detections
-    combined_mask = np.zeros((h, w), dtype=np.float32)
+    target_classes = [clsname.strip() for clsname in target_class.split(",")]
 
-    # Predict
     print(f"Running prediction with confidence threshold: {confidence}...")
-    results = model.predict(img_pil, conf=confidence)
-
-    saved_count = 0
-
-    layers = []
-
-    layers.append(
-        {"name": "base image", "image": img_pil}
+    _class_masks, all_segments = detect_frame(
+        img_pil, model, confidence, target_classes, block_size, mask_expand=mask_expand,
     )
 
-    target_classes = [clsname.strip() for clsname in target_class.split(",")]
-    
-    # Process results
-    for result_idx, result in enumerate(results):
-        if result.masks is None:
-            print("No segments detected in this result.")
-            continue
-            
-        masks_data = result.masks.data.cpu().numpy()
-        boxes = result.boxes.cpu()
-        class_names = model.names
-        
-        for mask_idx, (m, box) in enumerate(zip(masks_data, boxes)):
-            # Resize mask to fit original image size
-            mask_resized = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
-            mask_bin = np.clip(mask_resized, 0, 1)
-            
-            if block_size > 0:
-                margin_px = int(max(w, h) / block_size)
-                if margin_px > 0:
-                    kernel_size = margin_px * 2 + 1
-                    # 円形のカーネルを作成（角が丸くなるように膨張）
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-                    mask_bin = cv2.dilate(mask_bin, kernel, iterations=1)
-            
-            # Get class ID and name
-            cls_id = int(box.cls[0].item())
-            cls_name = class_names[cls_id]
-            conf = float(box.conf[0].item())
-            
-            # Create masked image (original image with alpha channel for transparency)
-            # Create a 4-channel image (RGBA)
-            rgba_img = np.zeros((h, w, 4), dtype=np.uint8)
-            rgba_img[:, :, :3] = img_np
-            # Set alpha channel based on mask
-            rgba_img[:, :, 3] = (mask_bin * 255).astype(np.uint8)
-            
-            # The rgba image is the original size with the background transparent
-            out_pil = Image.fromarray(rgba_img, 'RGBA')
+    layers = [{"name": "base image", "image": img_pil}]
+    combined_mask = np.zeros((h, w), dtype=np.float32)
+    saved_count = 0
 
-            if cls_name in target_classes:
-                # Accumulate this mask into the combined mask
-                combined_mask = np.maximum(combined_mask, mask_bin)
-
-                if mosaic_mode == MosaicMode.MOSAIC:
-                    out_pil = generate_mosaic(out_pil, block_size)
-                elif mosaic_mode == MosaicMode.BLUR:
-                    out_pil = generate_blur(out_pil, block_size)
-                elif mosaic_mode == MosaicMode.WHITE:
-                    out_pil = generate_white(out_pil, block_size)
-
-                layers.append(
-                    {"name": f"{cls_name} image {saved_count}", "image": out_pil}
-                )
-                print("add layer", cls_name)
-
-            saved_count += 1
+    for seg in all_segments:
+        cls_name = seg["cls_name"]
+        mask_bin = seg["mask"]
+        if cls_name in target_classes:
+            combined_mask = np.maximum(combined_mask, mask_bin)
+            processed = render_processed_layer(img_pil, mask_bin, mosaic_mode, block_size)
+            layers.append({"name": f"{cls_name} image {saved_count}", "image": processed})
+            print("add layer", cls_name)
+        saved_count += 1
 
     if save_psd:
         add_index = 0
@@ -172,7 +207,6 @@ def extract_and_save_segments(
         layer_img = layer_info['image'].convert("RGBA")
         composite_image = Image.alpha_composite(composite_image, layer_img)
 
-    # Convert combined_mask to PIL Image (mode 'L')
     combined_mask_pil = Image.fromarray((np.clip(combined_mask, 0, 1) * 255).astype(np.uint8), mode='L')
 
     return composite_image.convert("RGB"), combined_mask_pil
