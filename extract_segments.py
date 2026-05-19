@@ -7,56 +7,23 @@ import cv2
 
 from enum import Enum
 
-import psd_tools
-from psd_tools import PSDImage
-from psd_tools.api.layers import PixelLayer
+try:
+    from .psd_writer import write_psd_from_pil_layers
+except ImportError:
+    from psd_writer import write_psd_from_pil_layers
 
 
 def save_images_to_psd(layers_data: list, output_path: str):
-    """
-    複数のPIL画像をPSDのレイヤーとして保存する関数
-    :param layers_data: dictのリスト。各dictは {'name': 'レイヤー名', 'image': PIL.Imageオブジェクト}(下から上の順)
-    :param output_path: 保存先のファイルパス
+    """Write a multi-layer PSD using the bundled writer.
+
+    layers_data: list of {'name': str, 'image': PIL.Image} ordered bottom-to-top.
+    All layers must share the same size; that size becomes the canvas.
     """
     if not layers_data:
         raise ValueError("レイヤーデータが空です。")
 
-    # 全体のサイズを最初のレイヤーから取得する（全レイヤーが同じサイズである前提）
-    width, height = layers_data[0]['image'].size
-    
-    # 全体を合成したプレビュー画像（composite_image）を自動生成する
-    # 透明な背景を作成し、下から順番に画像を重ね合わせる
-    composite_image = Image.new("RGBA", (width, height), (255, 255, 255, 0))
-    for layer_info in layers_data:
-        layer_img = layer_info['image'].convert("RGBA")
-        composite_image = Image.alpha_composite(composite_image, layer_img)
-
-    # 1. PSDのベース（キャンバスとプレビュー画像）を作成
-    # psd-toolsは新規作成機能が乏しいため、まず合成画像からPSD全体を作成します
-    # 【修正点】ここでRGBAではなくRGBとしてベースを作成することで、謎の「名前無し・非表示の半透明アルファレイヤー」が生成されるのを防ぎます
-    psd = PSDImage.frompil(composite_image.convert("RGB"))
-    
-    # 【高度なハック】レイヤー自体はRGBA（透明度あり）のまま追加するため、一時的にヘッダーのチャンネル数を4(RGBA)に偽装します
-    psd._record.header.channels = 4
-    
-    for layer_info in layers_data:
-        layer_img = layer_info['image']
-        layer_name = layer_info.get('name', 'Layer')
-        
-        # 2. レイヤーオブジェクトを作成
-        # サイズ指定などの内部情報をpsdオブジェクトに合わせて初期化するために第2引数にpsdを渡します
-        # PixelLayer.frompil を呼ぶと、内部で自動的に psd に追加(append) されます。
-        pixel_layer = PixelLayer.frompil(layer_img.convert("RGBA"), psd)
-        pixel_layer.name = layer_name
-        
-    # 3. 保存前に元のチャンネル数「3（RGB）」に戻します
-    # これによりPSD全体としてはRGB画像（謎のアルファチャンネルなし）でありつつ、
-    # 内部の個別レイヤーはRGBA（透過情報あり）として正しく保存されます。
-    psd._record.header.channels = 3
-        
-    # 4. 保存
-    psd.save(output_path)
-    print(f"Saved PSD to {output_path} with {len(psd)} layers.")
+    write_psd_from_pil_layers(layers_data, output_path, compression="rle")
+    print(f"Saved PSD to {output_path} with {len(layers_data)} layers.")
 try:
     from ultralytics import YOLO
 except ImportError:

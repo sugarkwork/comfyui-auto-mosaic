@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "ultralytics",
-    "psd-tools",
     "opencv-python-headless"
 ]
 
