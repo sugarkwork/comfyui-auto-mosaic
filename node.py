@@ -107,7 +107,7 @@ class AutoMosaic:
                 "image": ("IMAGE",),
                 "save_psd": ("BOOLEAN", {"default": False}),
                 "filename_prefix": ("STRING", {"default": "AutoMosaic"}),
-                "confidence": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 1.0, "step": 0.01}),
+                "confidence": ("FLOAT", {"default": 0.25, "min": 0.01, "max": 1.0, "step": 0.01}),
                 "process_method": (["raw", "mosaic", "white", "blur"], {"default": "mosaic"}),
                 "factor": ("INT", {"default": 100, "min": 10, "step": 1}),
                 "target_class": ("STRING", {"default": "pussy,penis"}),

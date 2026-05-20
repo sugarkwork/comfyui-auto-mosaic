@@ -214,8 +214,8 @@ def build_processing_options_ui():
             label="Target Class (comma separated)"
         )
         confidence = gr.Slider(
-            minimum=0.01, maximum=1.0, step=0.01, 
-            value=0.5, 
+            minimum=0.01, maximum=1.0, step=0.01,
+            value=0.25,
             label="Confidence Threshold"
         )
         factor = gr.Slider(
