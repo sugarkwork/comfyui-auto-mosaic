@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 from PIL import Image, ImageFilter
 import cv2
+from concurrent.futures import ThreadPoolExecutor
 
 from enum import Enum
 
@@ -77,7 +78,7 @@ def _dilate_mask(mask_bin: np.ndarray, expand_px: int) -> np.ndarray:
     return cv2.dilate(mask_bin, kernel, iterations=1)
 
 
-def detect_frame(img_pil, model, confidence, target_classes, block_size, mask_expand=0.0):
+def detect_frame(img_pil, model, confidence, target_classes, block_size, mask_expand=0.0, model_label=None):
     """Run YOLO segmentation on a single frame and return per-class masks plus raw segments.
 
     Returns:
@@ -114,7 +115,7 @@ def detect_frame(img_pil, model, confidence, target_classes, block_size, mask_ex
             cls_name = class_names[cls_id]
             conf = float(box.conf[0].item())
 
-            all_segments.append({"cls_name": cls_name, "conf": conf, "mask": mask_bin})
+            all_segments.append({"cls_name": cls_name, "conf": conf, "mask": mask_bin, "model": model_label})
 
             if cls_name in target_classes:
                 if cls_name not in class_masks:
@@ -122,6 +123,44 @@ def detect_frame(img_pil, model, confidence, target_classes, block_size, mask_ex
                 class_masks[cls_name] = np.maximum(class_masks[cls_name], mask_bin)
 
     return class_masks, all_segments
+
+
+def _merge_class_masks(dst, src):
+    for cls_name, mask in src.items():
+        if cls_name not in dst:
+            dst[cls_name] = mask
+        else:
+            dst[cls_name] = np.maximum(dst[cls_name], mask)
+
+
+def detect_frame_with_models(img_pil, models, confidence, target_classes, block_size, mask_expand=0.0):
+    """Run YOLO segmentation with one or more loaded model instances and merge results."""
+    if not models:
+        raise ValueError("At least one YOLO model is required.")
+
+    if len(models) == 1:
+        model_label, model = models[0]
+        return detect_frame(
+            img_pil, model, confidence, target_classes, block_size,
+            mask_expand=mask_expand, model_label=model_label,
+        )
+
+    merged_class_masks = {}
+    merged_segments = []
+
+    def run_model(model_item):
+        model_label, model = model_item
+        return detect_frame(
+            img_pil, model, confidence, target_classes, block_size,
+            mask_expand=mask_expand, model_label=model_label,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(models)) as executor:
+        for class_masks, segments in executor.map(run_model, models):
+            _merge_class_masks(merged_class_masks, class_masks)
+            merged_segments.extend(segments)
+
+    return merged_class_masks, merged_segments
 
 
 def _make_rgba_from_mask(img_np_rgb: np.ndarray, mask: np.ndarray) -> Image.Image:
@@ -320,7 +359,7 @@ def fill_video_gaps(frames_np, frame_class_masks, buffer_frames, morph_method):
 def extract_and_save_segments(
     img_pil, base_name, model, output_dir, confidence=0.5,
     mosaic_mode: MosaicMode = MosaicMode.MOSAIC, target_class="pussy,penis", block_size=100,
-    save_psd=True, mask_expand: float = 0.0) -> Image.Image:
+    save_psd=True, mask_expand: float = 0.0, models=None) -> Image.Image:
     """
     Load an image and YOLO segmentation model, detect all segments, and save them as individual images.
     """
@@ -336,8 +375,9 @@ def extract_and_save_segments(
     target_classes = [clsname.strip() for clsname in target_class.split(",")]
 
     print(f"Running prediction with confidence threshold: {confidence}...")
-    _class_masks, all_segments = detect_frame(
-        img_pil, model, confidence, target_classes, block_size, mask_expand=mask_expand,
+    active_models = models if models is not None else [(None, model)]
+    _class_masks, all_segments = detect_frame_with_models(
+        img_pil, active_models, confidence, target_classes, block_size, mask_expand=mask_expand,
     )
 
     layers = [{"name": "base image", "image": img_pil}]

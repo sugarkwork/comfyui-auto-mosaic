@@ -26,6 +26,7 @@ if not os.path.exists(target_model_dir):
 
 CUSTOM_MODEL_URL = "https://huggingface.co/sugarknight/sensitive-detect/resolve/main/sensitive_detect_v07.pt"
 CUSTOM_MODEL_NAME = "sensitive_detect_v07.pt"
+NO_SECOND_MODEL = "None"
 
 # YOLO model file extensions
 MODEL_EXTENSIONS = (".pt", ".pth", ".onnx")
@@ -79,6 +80,7 @@ try:
         extract_and_save_segments,
         MosaicMode,
         detect_frame,
+        detect_frame_with_models,
         render_processed_layer,
         compose_frame,
         fill_video_gaps,
@@ -89,6 +91,7 @@ except ImportError:
         extract_and_save_segments,
         MosaicMode,
         detect_frame,
+        detect_frame_with_models,
         render_processed_layer,
         compose_frame,
         fill_video_gaps,
@@ -97,11 +100,12 @@ except ImportError:
 
 class AutoMosaic:
     def __init__(self):
-        self.model = None
-        self.model_name = ""
+        self.models = {}
 
     @classmethod
     def INPUT_TYPES(s):
+        available_models = get_available_models()
+        second_model_choices = [NO_SECOND_MODEL] + available_models
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -111,11 +115,12 @@ class AutoMosaic:
                 "process_method": (["raw", "mosaic", "white", "blur"], {"default": "mosaic"}),
                 "factor": ("INT", {"default": 100, "min": 10, "step": 1}),
                 "target_class": ("STRING", {"default": "pussy,penis"}),
-                "model_name": (get_available_models(), {"default": CUSTOM_MODEL_NAME}),
+                "model_name": (available_models, {"default": CUSTOM_MODEL_NAME}),
                 "mask_expand": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.1}),
                 "video_mode": ("BOOLEAN", {"default": False}),
                 "buffer_frames": ("INT", {"default": 10, "min": 1, "max": 120, "step": 1}),
                 "morph_method": (["simple", "optical_flow"], {"default": "simple"}),
+                "model_name_2": (second_model_choices, {"default": NO_SECOND_MODEL}),
             },
         }
 
@@ -125,8 +130,8 @@ class AutoMosaic:
     CATEGORY = "image/process"
 
     def _ensure_model(self, model_name):
-        if self.model is not None and self.model_name == model_name:
-            return
+        if model_name in self.models:
+            return self.models[model_name]
 
         potential_paths = [
             os.path.join(ultralytics_dir, model_name),
@@ -144,8 +149,27 @@ class AutoMosaic:
                 model_path = download_dest
 
         logging.info(f"Loading YOLO model: {model_path}")
-        self.model = YOLO(model_path)
-        self.model_name = model_name
+        model = YOLO(model_path)
+        self._warmup_model(model, model_name)
+        self.models[model_name] = model
+        return model
+
+    @staticmethod
+    def _warmup_model(model, model_name):
+        logging.info(f"Warming up YOLO model: {model_name}")
+        warmup_image = Image.new("RGB", (64, 64), (0, 0, 0))
+        model.predict(warmup_image, conf=0.99, verbose=False)
+
+    def _ensure_models(self, model_name, model_name_2=NO_SECOND_MODEL):
+        model_names = []
+        for name in (model_name, model_name_2):
+            if name and name != NO_SECOND_MODEL and name not in model_names:
+                model_names.append(name)
+
+        if not model_names:
+            model_names.append(CUSTOM_MODEL_NAME)
+
+        return [(name, self._ensure_model(name)) for name in model_names]
 
     @staticmethod
     def _resolve_mosaic_mode(process_method):
@@ -159,8 +183,8 @@ class AutoMosaic:
 
     def process_image(self, image, save_psd, filename_prefix, confidence, process_method, factor,
                       target_class, model_name=CUSTOM_MODEL_NAME, mask_expand=0.0,
-                      video_mode=False, buffer_frames=10, morph_method="simple"):
-        self._ensure_model(model_name)
+                      video_mode=False, buffer_frames=10, morph_method="simple", model_name_2=NO_SECOND_MODEL):
+        active_models = self._ensure_models(model_name, model_name_2)
 
         output_dir = folder_paths.get_output_directory()
         mosaic_mode = self._resolve_mosaic_mode(process_method)
@@ -171,6 +195,7 @@ class AutoMosaic:
                 confidence=confidence, mosaic_mode=mosaic_mode, factor=factor,
                 target_class=target_class, output_dir=output_dir,
                 mask_expand=mask_expand, buffer_frames=buffer_frames, morph_method=morph_method,
+                active_models=active_models,
             )
 
         processed_images = []
@@ -187,7 +212,7 @@ class AutoMosaic:
             composite_pil, mask_pil = extract_and_save_segments(
                 img_pil=img_pil,
                 base_name=base_name,
-                model=self.model,
+                model=active_models[0][1],
                 output_dir=full_output_folder,
                 confidence=confidence,
                 mosaic_mode=mosaic_mode,
@@ -195,6 +220,7 @@ class AutoMosaic:
                 block_size=factor,
                 save_psd=save_psd,
                 mask_expand=mask_expand,
+                models=active_models,
             )
 
             out_img_np = np.array(composite_pil).astype(np.float32) / 255.0
@@ -206,7 +232,7 @@ class AutoMosaic:
         return {"ui": {"text": ["Successfully saved PSD"]}, "result": (torch.stack(processed_images), torch.stack(processed_masks))}
 
     def _process_video(self, image, save_psd, filename_prefix, confidence, mosaic_mode, factor,
-                       target_class, output_dir, mask_expand, buffer_frames, morph_method):
+                       target_class, output_dir, mask_expand, buffer_frames, morph_method, active_models):
         target_classes = [c.strip() for c in target_class.split(",")]
 
         frames_pil = []
@@ -226,8 +252,8 @@ class AutoMosaic:
         # Detect on every frame.
         frame_class_masks = []
         for img_pil in frames_pil:
-            class_masks, _segments = detect_frame(
-                img_pil, self.model, confidence, target_classes, factor, mask_expand=mask_expand,
+            class_masks, _segments = detect_frame_with_models(
+                img_pil, active_models, confidence, target_classes, factor, mask_expand=mask_expand,
             )
             frame_class_masks.append(class_masks)
 
